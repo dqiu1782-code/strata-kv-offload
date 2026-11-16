@@ -1,5 +1,7 @@
 # Training-free block selection and KV offload for a hybrid MoE model
 
+> **A patch for [Strata](https://github.com/Niko1221/Strata) (MIT).** Made against Strata 0.1.58; also applies cleanly to 0.1.60.1 (checked 2026-11-16).
+
 Long contexts on a small GPU for **Qwen3.6-35B-A3B**, a model that mixes linear attention (Gated DeltaNet) with a few
 full-attention layers and has no built-in sparse-attention indexer.
 
