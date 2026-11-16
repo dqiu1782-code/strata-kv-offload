@@ -1,0 +1,317 @@
+--- a/src/qwen35/q36_engine.cu
++++ b/src/qwen35/q36_engine.cu
+@@ -108,6 +108,8 @@
+     __syncthreads();
+     return r;
+ }
++
++#include "q36_sel.cuh"
+ 
+ /// y[r] = rms(x[r]) * w, one block per row of n.
+ __global__ void k_rms(const float* x, const float* w, float* y, int n, float eps) {
+@@ -1129,6 +1131,31 @@
+     CK(cudaMemset(p, 0, n * 4));
+     return p;
+ }
++// STRATA_Q36_VRAM_CAP=<GiB>: pretend the card has that much VRAM (all free-memory decisions follow it; nothing is enforced).
++// Unset = the real card, behaviour unchanged.
++static cudaError_t capMemInfo(size_t* fr, size_t* tot) {
++    const cudaError_t e = cudaMemGetInfo(fr, tot);
++    if (e != cudaSuccess) return e;
++    const char* c = std::getenv("STRATA_Q36_VRAM_CAP");
++    if (c && *c) {
++        const double gib = std::atof(c);
++        if (gib > 0) {
++            const size_t cap = (size_t) (gib * 1073741824.0);
++            const size_t used = *tot - *fr;
++            if (cap < *tot) {
++                *tot = cap;
++                *fr = used >= cap ? 0 : cap - used;
++            }
++        }
++    }
++    return cudaSuccess;
++}
++float* halloc(size_t n) {   // pinned host memory the device reads and writes directly (STRATA_Q36_KVHOST=1)
++    float* p = nullptr;
++    CK(cudaHostAlloc((void**) &p, n * 4, cudaHostAllocDefault));
++    std::memset(p, 0, n * 4);
++    return p;
++}
+ template <class T> T* dalloc_t(size_t n) {
+     T* p = nullptr;
+     CK(cudaMalloc(&p, n * sizeof(T)));
+@@ -1161,6 +1188,28 @@
+     int32_t* ami;
+     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
+     std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
++    // block selection (STRATA_Q36_SEL=1, q36_sel.cuh): per attention layer the window means of the keys
++    std::vector<float*> km;
++    bool sel_on = false;
++    // GPU block pool in front of the host K / V (STRATA_Q36_KVPOOL=<slots per KV head and layer>, needs KVHOST)
++    bool pool_on = false;
++    int pool_p = 0;
++    std::vector<float*> pool_k, pool_v;
++    std::vector<int32_t*> pool_tag, pool_last, pool_state;
++    int32_t* pool_slots = nullptr;
++    int32_t* pool_stat = nullptr;
++    void pool_report() {
++        if (!pool_on) return;
++        int32_t h[2] = {0, 0};
++        CK(cudaMemcpy(h, pool_stat, sizeof h, cudaMemcpyDeviceToHost));
++        CK(cudaMemset(pool_stat, 0, sizeof h));
++        std::fprintf(stderr, "strata-q36: block pool: %d misses of %d lookups (hit rate %.2f%%)\n", h[0], h[1],
++                     h[1] > 0 ? 100.0 * (h[1] - h[0]) / h[1] : 0.0);
++    }
++    bool kvhost = false;   // the main layers' K / V in pinned host memory (needs sel_on)
++    int nkmax = 0;
++    float* sel_logit = nullptr;
++    int32_t* sel_ids = nullptr;
+     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
+     static constexpr int kVerify = 8;
+     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
+@@ -1196,7 +1245,7 @@
+     // recurrent state and KV cache, so N requests run at once: their rows share one decode window (forward_rows).  The
+     // members conv / S / kc / vc / pos / hlast above are the CURRENT session's (select() swaps them).
+     struct Sess {
+-        std::vector<float*> conv, S, kc, vc;
++        std::vector<float*> conv, S, kc, vc, km;
+         float* hlast = nullptr;
+         int64_t pos = 0;
+         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
+@@ -1295,8 +1344,10 @@
+             if (L.attn) {
+                 ss.conv.push_back(nullptr);
+                 ss.S.push_back(nullptr);
+-                ss.kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+-                ss.vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
++                ss.kc.push_back(kvhost ? halloc((size_t) g.n_head_kv * ctx * g.head_dim)
++                                       : dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
++                ss.vc.push_back(kvhost ? halloc((size_t) g.n_head_kv * ctx * g.head_dim)
++                                       : dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+             } else {
+                 ss.conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
+                 ss.S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
+@@ -1310,6 +1361,10 @@
+             ss.kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+             ss.vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+         }
++        ss.km.assign(ss.kc.size(), nullptr);
++        if (sel_on)
++            for (size_t l = 0; l < m->layers.size(); ++l)
++                if (m->layers[l].attn) ss.km[l] = dalloc((size_t) g.n_head_kv * nkmax * g.head_dim);
+         ss.hlast = dalloc((size_t) g.n_embd);
+     }
+ 
+@@ -1322,7 +1377,7 @@
+     }
+     void load_cur() {
+         Sess& ss = sess[(size_t) cur];
+-        conv = ss.conv; S = ss.S; kc = ss.kc; vc = ss.vc;
++        conv = ss.conv; S = ss.S; kc = ss.kc; vc = ss.vc; km = ss.km;
+         hlast = ss.hlast;
+         pos = ss.pos;
+         ss.used = ++use_clock;
+@@ -1344,6 +1399,41 @@
+         vision = vision_;
+         tmax = std::max(tmax_, kVerify);
+         const auto& g = m->g;
++        if (std::getenv("STRATA_Q36_SEL") && n_sess == 1 && ctx > kSelN * kSelBS && ctx <= kSelNbMax * kSelBS &&
++            g.n_head == g.n_head_kv * kSelG && g.head_dim == kSelHD) {
++            sel_on = true;
++            kvhost = std::getenv("STRATA_Q36_KVHOST") != nullptr;
++            nkmax = sel_windows(ctx) + 1;
++            sel_logit = dalloc((size_t) g.n_head_kv * kSelG * nkmax);
++            sel_ids = dalloc_t<int32_t>((size_t) g.n_head_kv * kSelN);
++            if (kvhost) std::fprintf(stderr, "strata-q36: the main layers' K / V live in pinned host memory\n");
++            if (kvhost && std::getenv("STRATA_Q36_KVPOOL")) {
++                pool_p = std::atoi(std::getenv("STRATA_Q36_KVPOOL"));
++                if (pool_p < 128) pool_p = 256;
++                if (pool_p > 512) pool_p = 512;
++                pool_on = true;
++                const size_t nl = m->layers.size(), hk = (size_t) g.n_head_kv;
++                pool_k.assign(nl, nullptr); pool_v.assign(nl, nullptr);
++                pool_tag.assign(nl, nullptr); pool_last.assign(nl, nullptr); pool_state.assign(nl, nullptr);
++                for (size_t l = 0; l < nl; ++l) {
++                    if (!m->layers[l].attn) continue;
++                    pool_k[l] = dalloc(hk * (pool_p + kPoolRing) * kSelBS * kSelHD);
++                    pool_v[l] = dalloc(hk * (pool_p + kPoolRing) * kSelBS * kSelHD);
++                    pool_tag[l] = dalloc_t<int32_t>(hk * pool_p);
++                    pool_last[l] = dalloc_t<int32_t>(hk * pool_p);
++                    pool_state[l] = dalloc_t<int32_t>(hk);
++                    CK(cudaMemset(pool_tag[l], 0xFF, hk * pool_p * 4));
++                    CK(cudaMemset(pool_last[l], 0, hk * pool_p * 4));
++                    CK(cudaMemset(pool_state[l], 0, hk * 4));
++                }
++                pool_slots = dalloc_t<int32_t>(hk * kSelN);
++                pool_stat = dalloc_t<int32_t>(2);
++                CK(cudaMemset(pool_stat, 0, 8));
++                std::fprintf(stderr, "strata-q36: GPU block pool: %d slots of %d cells per KV head and layer\n", pool_p, kSelBS);
++            }
++            std::fprintf(stderr, "strata-q36: block selection on: %d blocks of %d cells per step, the newest %d and block 0 always\n",
++                         kSelN, kSelBS, kSelLocal);
++        }
+         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
+         const size_t C = (size_t) g.ssm_conv_channels;
+         CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+@@ -1457,7 +1547,7 @@
+             const size_t per = (size_t) (g.n_head_kv * g.head_dim * 2 * 4) * (size_t) ctx * n_attn +
+                                (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
+             size_t fr0 = 0, tot0 = 0;
+-            CK(cudaMemGetInfo(&fr0, &tot0));
++            CK(capMemInfo(&fr0, &tot0));
+             if (n_sess > 1)
+                 std::fprintf(stderr, "strata-q36: %d sessions (--batch): %.2f GiB of VRAM each at a context of %d (%.2f GiB in "
+                              "all), %.2f GiB free before them\n", n_sess, (double) per / (1 << 30), ctx,
+@@ -1505,7 +1595,7 @@
+         load_cur();
+         CK(cudaDeviceSynchronize());   // every legacy-stream cudaMemset of the buffers above is done
+         size_t fr = 0, tot = 0;
+-        CK(cudaMemGetInfo(&fr, &tot));
++        CK(capMemInfo(&fr, &tot));
+         std::fprintf(stderr, "strata-q36: context %d cells, prompt chunk %d%s, %.2f GiB of VRAM free\n", ctx, tmax,
+                      m->has_mtp ? ", MTP block loaded" : "", (double) fr / (1 << 30));
+     }
+@@ -1942,7 +2032,28 @@
+             k_attn_prep<<<dim3(H + HKV, T), kThreads, 0, st>>>(qg, kx, vx, L.q_norm, L.k_norm, q, gate, rows_mode ? nullptr : kc[li],
+                                                               rows_mode ? nullptr : vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
+                                                               m->rope_base, m->eps, d_delta, mtab_now, rs);
+-            if (T > kGemmT) {
++            const bool sel_layer = sel_on && !rows_mode && li < m->layers.size();
++            if (sel_layer && pool_on)
++                k_pool_inval<<<HKV, 256, 0, st>>>(pool_tag[li], pool_p, dpos);
++            if (sel_layer)
++                k_kmean_upd<<<dim3(T / kSelStride + 2, HKV), HD, 0, st>>>(kc[li], km[li], ctx, nkmax, dpos, T);
++            if (sel_layer && pool_on)
++                k_recent_sync<<<dim3((unsigned) std::min<size_t>((size_t) T, (size_t) kPoolRing * kSelBS), HKV), 256, 0, st>>>(
++                    kc[li], vc[li], pool_k[li], pool_v[li], pool_p + kPoolRing, pool_p, ctx, dpos, (int) T);
++            if (sel_layer && T == 1) {   // one token: 96 selected blocks instead of every cell
++                k_sel_score<<<dim3((nkmax + 7) / 8, HKV), 256, 0, st>>>(q, km[li], sel_logit, nkmax, dpos);
++                k_sel_pick<<<HKV, 1024, 0, st>>>(sel_logit, nkmax, dpos, sel_ids);
++                if (pool_on) {
++                    k_pool_map<<<HKV, 512, 0, st>>>(sel_ids, pool_slots, pool_tag[li], pool_last[li], pool_state[li],
++                                                    pool_stat, pool_p, dpos);
++                    k_pool_copy<<<dim3(kSelN, HKV), 256, 0, st>>>(kc[li], vc[li], sel_ids, pool_slots, pool_k[li],
++                                                                  pool_v[li], pool_p + kPoolRing, ctx);
++                }
++                k_sel_part<<<dim3(kSelN / 4, HKV), kChunkCells, 0, st>>>(
++                    q, kc[li], vc[li], sel_ids, pool_on ? pool_slots : nullptr, pool_on ? pool_k[li] : nullptr,
++                    pool_on ? pool_v[li] : nullptr, pool_p + kPoolRing, dpos, ctx, 1.0f / sqrtf((float) HD), n_chunk, pacc, pm, pl);
++                k_sel_merge<<<H, HD, 0, st>>>(pacc, pm, pl, gate, n_chunk, att);
++            } else if (T > kGemmT) {
+                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
+                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
+                 // FP16 probabilities; the queries in slices whose scores fit
+@@ -2811,7 +2922,7 @@
+         max_layer = std::max(max_layer, L->stride * (size_t) ne);
+     }
+     size_t fr = 0, tot = 0;
+-    CK(cudaMemGetInfo(&fr, &tot));
++    CK(capMemInfo(&fr, &tot));
+     const size_t reserve = (size_t) 768 << 20;
+     const size_t budget = vram_gib >= 0 ? (size_t) (vram_gib * (double) (1ull << 30))
+                                         : (fr > reserve ? fr - reserve : 0);
+@@ -2835,7 +2946,7 @@
+         }
+         m.packed.clear();
+         E.reset_graphs();
+-        CK(cudaMemGetInfo(&fr, &tot));
++        CK(capMemInfo(&fr, &tot));
+         std::fprintf(stderr, "strata-q36: the packed Q8_0 decode copies (%.2f GiB) given back so that every routed "
+                      "expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)\n",
+                      (double) packed_bytes / (1 << 30));
+@@ -2857,7 +2968,7 @@
+             mtp_only = true;
+         } else if (total_main + ((size_t) 64 << 20) <= room) {
+             E.shrink_att((size_t) 16 << 20);
+-            CK(cudaMemGetInfo(&fr, &tot));
++            CK(capMemInfo(&fr, &tot));
+             budget2 = fr > small_reserve ? fr - small_reserve : 0;
+             mtp_only = total_main + ((size_t) 64 << 20) <= budget2;
+             std::fprintf(stderr, "strata-q36: the experts nearly fit: the attention scores buffer at 64 MB and the VRAM "
+@@ -2924,17 +3035,20 @@
+     // host memory: every expert, pinned where the driver allows it (the prompt's stream and the slot copies)
+     size_t host = 0;
+     for (Layer* L : all)
+-        if (!mtp_only || L == &m.mtp) host += L->stride * (size_t) ne + kMmqTail;
++        if (!mtp_only || L == &m.mtp) host += (L->stride * (size_t) ne + kMmqTail + 4095) & ~(size_t) 4095;
+     uint8_t* arena = nullptr;
+     bool pinned = cudaHostAlloc((void**) &arena, host, cudaHostAllocDefault) == cudaSuccess;
+     if (!pinned) {
+         (void) cudaGetLastError();
+-        arena = (uint8_t*) std::malloc(host);
++        arena = (uint8_t*) std::malloc(host + 4096);
+         if (!arena) {
+             err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
+             return false;
+         }
+     }
++    uint8_t* abase = (uint8_t*) (((uintptr_t) arena + 4095) & ~(uintptr_t) 4095);
++    size_t pin_bytes = 0;
++    bool pin_more = !pinned;   // Windows caps page-locked memory at about half of the RAM: pin layer by layer while it lasts
+     size_t off = 0;
+     E.hy.resize(all.size());
+     for (size_t li = 0; li < all.size(); ++li) {
+@@ -2950,8 +3064,18 @@
+             L.n_slots = (int) ne;
+             continue;
+         }
+-        L.hblobs = arena + off;
+-        off += L.stride * (size_t) ne + kMmqTail;
++        L.hblobs = abase + off;
++        const size_t lay_sz = (L.stride * (size_t) ne + kMmqTail + 4095) & ~(size_t) 4095;
++        off += lay_sz;
++        if (pin_more) {
++            if (cudaHostRegister(L.hblobs, lay_sz, cudaHostRegisterPortable) == cudaSuccess) pin_bytes += lay_sz;
++            else {
++                (void) cudaGetLastError();
++                pin_more = false;
++                std::fprintf(stderr, "strata-q36: the pinned-memory limit is reached: the first %.2f of %.2f GiB of the experts (%zu layers) are pinned, the rest pageable\n",
++                             (double) pin_bytes / 1073741824.0, (double) host / 1073741824.0, li);
++            }
++        }
+         std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
+         for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
+         L.n_slots = S;
+@@ -3047,6 +3171,16 @@
+ 
+ std::vector<int32_t> parse_ids(const char* s) {
+     std::vector<int32_t> v;
++    std::string file_text;   // "@path": the ids come from a file (a long prompt does not fit a command line)
++    if (*s == '@') {
++        if (FILE* f = std::fopen(s + 1, "rb")) {
++            char tmp[1 << 16];
++            size_t n;
++            while ((n = std::fread(tmp, 1, sizeof tmp, f)) > 0) file_text.append(tmp, n);
++            std::fclose(f);
++        }
++        s = file_text.c_str();
++    }
+     while (*s) {
+         while (*s == ',' || *s == ' ') ++s;
+         if (!*s) break;
+@@ -3813,7 +3947,7 @@
+         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
+         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
+         size_t fr = 0, tot = 0, experts = 0;
+-        CK(cudaMemGetInfo(&fr, &tot));
++        CK(capMemInfo(&fr, &tot));
+         for (const Layer& L : m.layers) experts += L.stride * (size_t) m.g.n_expert;
+         const size_t fr_raw = fr;   // before the packed Q8_0 copies count as given back
+         // (the MTP block's experts can go to the CPU, the packed Q8_0 copies can be given back: see place_experts)
+@@ -3903,6 +4037,7 @@
+                         (double) toks.size() / (pp_ms / 1000.0), bench_tg,
+                         bench_tg > 0 ? (double) bench_tg / (tg_ms / 1000.0) : 0.0);
+             std::fflush(stdout);
++            E.pool_report();
+         }
+         return 0;
+     }
+@@ -3965,6 +4100,7 @@
+     std::printf("gen:");
+     for (int t : gen) std::printf(" %d", t);
+     std::printf("\n");
++    E.pool_report();
+     std::fprintf(stderr, "strata-q36: prompt %zu tokens in %.1f ms (%.1f tok/s), %zu generated in %.1f ms (%.1f tok/s)\n",
+                  prompt.size(), pp_ms, prompt.size() / (pp_ms / 1000.0), gen.size(), ms_since(t1),
+                  gen.size() / (ms_since(t1) / 1000.0));
